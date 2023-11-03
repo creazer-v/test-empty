@@ -11,7 +11,7 @@ resource "aws_instance" "afhuif2" {
   instance_type                        = var.instance_type
   iam_instance_profile                 = var.iam_instance_profile
   associate_public_ip_address          = length(var.network_interface_id) != 0 ? null : false
-  vpc_security_group_ids               = length(var.network_interface_id) != 0 ? null : concat([data.aws_security_group.ansible_security_group.id], var.vpc_security_group_ids)
+  vpc_security_group_ids               = length(var.network_interface_id) != 0 ? null : var.vpc_security_group_ids
   monitoring                           = var.monitoring
   subnet_id                            = length(var.network_interface_id) != 0 ? null : element(var.subnet_ids, count.index)
   source_dest_check                    = length(var.network_interface_id) != 0 ? null : var.source_dest_check
