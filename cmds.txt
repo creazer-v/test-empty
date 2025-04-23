@@ -1,0 +1,5 @@
+git rev-list --objects --all | 
+  git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' | 
+  sed -n 's/^blob //p' | 
+  sort -k2nr | 
+  head -n 20
