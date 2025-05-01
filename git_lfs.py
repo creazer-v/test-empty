@@ -1,23 +1,26 @@
 import os
 import subprocess
 import logging
+import sys
+import platform
 from typing import List, Dict, Optional, Union, Tuple
 
 class GitLFS:
     """
-    A Python library for interacting with Git LFS (Large File Storage) 
-    to handle large files in GitHub repositories.
+    A Python library for pushing Git LFS (Large File Storage) objects to remote repositories.
     """
     
-    def __init__(self, repo_path: str = None, log_level: int = logging.INFO):
+    def __init__(self, repo_path: str = None, log_level: int = logging.INFO, git_path: str = None):
         """
         Initialize GitLFS with a repository path.
         
         Args:
             repo_path: Path to the git repository. If None, uses current directory.
             log_level: Logging level (default: logging.INFO)
+            git_path: Path to git executable (default: "git")
         """
         self.repo_path = repo_path or os.getcwd()
+        self.git_path = git_path or "git"
         
         # Set up logging
         self.logger = logging.getLogger('GitLFS')
@@ -28,31 +31,72 @@ class GitLFS:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
     
-    def _run_command(self, command: List[str]) -> Tuple[int, str, str]:
+    def _run_command(self, command: List[str], stream_output: bool = False) -> Tuple[int, str, str]:
         """
         Run a shell command and return the exit code, stdout, and stderr.
+        Optionally streams output in real-time.
         
         Args:
             command: List of command and arguments
+            stream_output: If True, logs stdout/stderr lines in real-time (default: False)
             
         Returns:
-            Tuple of (return_code, stdout, stderr)
+            Tuple of (return_code, collected_stdout, collected_stderr)
         """
         self.logger.debug(f"Running command: {' '.join(command)}")
+        stdout_lines = []
+        stderr_lines = []
         
         try:
+            # For Windows, ensure correct path handling
+            if platform.system() == 'Windows' and command[0] == 'git':
+                command[0] = self.git_path
+                
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=self.repo_path,
-                text=True
+                text=True,  # Use text mode for easier line reading
+                bufsize=1,  # Line buffered
+                universal_newlines=True # Ensure cross-platform newline handling
             )
-            stdout, stderr = process.communicate()
-            return process.returncode, stdout, stderr
+
+            # Stream output if requested
+            if stream_output:
+                self.logger.info("--- Command Output Start ---")
+                # Read line by line from stdout and stderr
+                while True:
+                    # Check stdout
+                    stdout_line = process.stdout.readline()
+                    if stdout_line:
+                        line_content = stdout_line.strip()
+                        self.logger.info(f"[stdout] {line_content}")
+                        stdout_lines.append(line_content)
+                    
+                    # Check stderr - LFS progress usually goes here
+                    stderr_line = process.stderr.readline()
+                    if stderr_line:
+                        line_content = stderr_line.strip()
+                        # Log stderr as INFO to ensure visibility, tag it clearly
+                        self.logger.info(f"[stderr] {line_content}") 
+                        stderr_lines.append(line_content)
+
+                    # Check if process has finished
+                    if process.poll() is not None and not stdout_line and not stderr_line:
+                        break 
+                self.logger.info("--- Command Output End ---")
+            else:
+                # If not streaming, collect output after completion
+                stdout_data, stderr_data = process.communicate()
+                stdout_lines = stdout_data.splitlines()
+                stderr_lines = stderr_data.splitlines()
+
+            return process.returncode, '\n'.join(stdout_lines), '\n'.join(stderr_lines)
         except Exception as e:
             self.logger.error(f"Error executing command: {e}")
-            return -1, "", str(e)
+            # Ensure lists are joined even on error if some lines were captured
+            return -1, '\n'.join(stdout_lines), '\n'.join(stderr_lines) + f"\nException: {str(e)}"
     
     def is_lfs_installed(self) -> bool:
         """
@@ -61,7 +105,7 @@ class GitLFS:
         Returns:
             True if installed, False otherwise
         """
-        code, _, _ = self._run_command(['git', 'lfs', 'version'])
+        code, _, _ = self._run_command([self.git_path, 'lfs', 'version'])
         return code == 0
     
     def install_lfs(self) -> bool:
@@ -71,179 +115,71 @@ class GitLFS:
         Returns:
             True if successful, False otherwise
         """
-        code, stdout, stderr = self._run_command(['git', 'lfs', 'install'])
+        code, stdout, stderr = self._run_command([self.git_path, 'lfs', 'install'])
         if code != 0:
             self.logger.error(f"Failed to install Git LFS: {stderr}")
             return False
         self.logger.info("Git LFS installed successfully")
         return True
     
-    def track_file(self, file_pattern: str) -> bool:
+    def push(self, remote: str = "origin", force: bool = False) -> bool:
         """
-        Track files matching the pattern with Git LFS.
+        Push all LFS objects, branches, and tags to the remote repository.
+        This should be used after commands like 'git lfs migrate' which rewrite history.
         
         Args:
-            file_pattern: Pattern of files to track (e.g., "*.psd", "*.zip")
+            remote: Remote repository name or URL (default: origin)
+            force: Whether to force push (REQUIRED after history rewrite, default: False)
             
         Returns:
             True if successful, False otherwise
         """
-        code, stdout, stderr = self._run_command(['git', 'lfs', 'track', file_pattern])
+        # First ensure all LFS objects are pushed for all refs
+        self.logger.info(f"Pushing LFS objects for all refs to {remote}...")
+        lfs_push_command = [self.git_path, 'lfs', 'push', '--all', remote]
+        # Stream output for LFS push
+        code, stdout, stderr = self._run_command(lfs_push_command, stream_output=True) 
         if code != 0:
-            self.logger.error(f"Failed to track {file_pattern}: {stderr}")
+            self.logger.error(f"Failed to push LFS objects. See output above.")
+            # Stderr might already be logged if streaming, but log again just in case
+            self.logger.debug(f"LFS Push Stderr:\n{stderr}") 
+            self.logger.debug(f"LFS Push Stdout:\n{stdout}")
             return False
-        self.logger.info(f"Now tracking {file_pattern} with Git LFS")
+        self.logger.info("LFS objects pushed successfully.")
+
+        # Then push all branches
+        self.logger.info(f"Pushing all branches to {remote}...")
+        push_branches_command = [self.git_path, 'push', '--all']
+        if force:
+            push_branches_command.append('-f')
+        push_branches_command.append(remote)
+        # Stream output for git push branches
+        code, stdout, stderr = self._run_command(push_branches_command, stream_output=True)
+        if code != 0:
+            self.logger.error(f"Failed to push branches. See output above.")
+            self.logger.debug(f"Branch Push Stderr:\n{stderr}")
+            self.logger.debug(f"Branch Push Stdout:\n{stdout}")
+            # Continue to tag push attempt
+        else:
+             self.logger.info("All branches pushed successfully.")
+
+        # Finally, push all tags
+        self.logger.info(f"Pushing all tags to {remote}...")
+        push_tags_command = [self.git_path, 'push', '--tags']
+        if force:
+            push_tags_command.append('-f')
+        push_tags_command.append(remote)
+        # Stream output for git push tags
+        code, stdout, stderr = self._run_command(push_tags_command, stream_output=True)
+        if code != 0:
+            self.logger.error(f"Failed to push tags. See output above.")
+            self.logger.debug(f"Tag Push Stderr:\n{stderr}")
+            self.logger.debug(f"Tag Push Stdout:\n{stdout}")
+            return False # Return False if tags fail
+
+        self.logger.info("All tags pushed successfully.")
+        self.logger.info(f"Successfully pushed all branches and tags to {remote}")
         return True
-    
-    def untrack_file(self, file_pattern: str) -> bool:
-        """
-        Stop tracking files matching the pattern with Git LFS.
-        
-        Args:
-            file_pattern: Pattern of files to untrack
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        code, stdout, stderr = self._run_command(['git', 'lfs', 'untrack', file_pattern])
-        if code != 0:
-            self.logger.error(f"Failed to untrack {file_pattern}: {stderr}")
-            return False
-        self.logger.info(f"Stopped tracking {file_pattern} with Git LFS")
-        return True
-    
-    def list_tracked_files(self) -> List[str]:
-        """
-        List all patterns currently tracked by Git LFS.
-        
-        Returns:
-            List of tracked patterns
-        """
-        code, stdout, stderr = self._run_command(['git', 'lfs', 'track'])
-        if code != 0:
-            self.logger.error(f"Failed to list tracked files: {stderr}")
-            return []
-        
-        tracked_patterns = []
-        for line in stdout.splitlines():
-            if line.startswith("Tracking "):
-                pattern = line.replace("Tracking ", "").strip()
-                tracked_patterns.append(pattern)
-        
-        return tracked_patterns
-    
-    def add_file(self, file_path: str) -> bool:
-        """
-        Add a file to git staging area.
-        
-        Args:
-            file_path: Path to the file to add
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        code, stdout, stderr = self._run_command(['git', 'add', file_path])
-        if code != 0:
-            self.logger.error(f"Failed to add {file_path}: {stderr}")
-            return False
-        self.logger.info(f"Added {file_path} to staging area")
-        return True
-    
-    def commit(self, message: str) -> bool:
-        """
-        Commit staged changes.
-        
-        Args:
-            message: Commit message
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        code, stdout, stderr = self._run_command(['git', 'commit', '-m', message])
-        if code != 0:
-            self.logger.error(f"Failed to commit: {stderr}")
-            return False
-        self.logger.info(f"Committed with message: {message}")
-        return True
-    
-    def push(self, remote: str = "origin", branch: str = "main") -> bool:
-        """
-        Push commits and LFS objects to remote repository.
-        
-        Args:
-            remote: Remote repository name (default: origin)
-            branch: Branch to push to (default: main)
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        # First push LFS objects
-        code, stdout, stderr = self._run_command(['git', 'lfs', 'push', remote, branch])
-        if code != 0:
-            self.logger.error(f"Failed to push LFS objects: {stderr}")
-            return False
-        
-        # Then push the commits
-        code, stdout, stderr = self._run_command(['git', 'push', remote, branch])
-        if code != 0:
-            self.logger.error(f"Failed to push commits: {stderr}")
-            return False
-        
-        self.logger.info(f"Successfully pushed to {remote}/{branch}")
-        return True
-    
-    def pull(self, remote: str = "origin", branch: str = "main") -> bool:
-        """
-        Pull changes and LFS objects from remote repository.
-        
-        Args:
-            remote: Remote repository name (default: origin)
-            branch: Branch to pull from (default: main)
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        code, stdout, stderr = self._run_command(['git', 'lfs', 'pull', remote, branch])
-        if code != 0:
-            self.logger.error(f"Failed to pull: {stderr}")
-            return False
-        self.logger.info(f"Successfully pulled from {remote}/{branch}")
-        return True
-    
-    def check_large_files(self, size_threshold_mb: int = 100) -> List[Dict[str, Union[str, int]]]:
-        """
-        Find potentially large files in the repository that might need LFS.
-        
-        Args:
-            size_threshold_mb: Size threshold in MB to consider a file as large
-            
-        Returns:
-            List of dictionaries with file information
-        """
-        large_files = []
-        for root, _, files in os.walk(self.repo_path):
-            # Skip .git directory
-            if ".git" in root:
-                continue
-                
-            for file in files:
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, self.repo_path)
-                
-                try:
-                    size_bytes = os.path.getsize(file_path)
-                    size_mb = size_bytes / (1024 * 1024)
-                    
-                    if size_mb >= size_threshold_mb:
-                        large_files.append({
-                            'path': rel_path,
-                            'size_bytes': size_bytes,
-                            'size_mb': round(size_mb, 2)
-                        })
-                except Exception as e:
-                    self.logger.warning(f"Could not check size of {rel_path}: {e}")
-        
-        return large_files
     
     def status(self) -> Dict[str, List[str]]:
         """
@@ -252,7 +188,7 @@ class GitLFS:
         Returns:
             Dictionary with LFS file status
         """
-        code, stdout, stderr = self._run_command(['git', 'lfs', 'status'])
+        code, stdout, stderr = self._run_command([self.git_path, 'lfs', 'status'])
         if code != 0:
             self.logger.error(f"Failed to get LFS status: {stderr}")
             return {}
@@ -285,7 +221,7 @@ class GitLFS:
         Returns:
             String containing LFS logs
         """
-        code, stdout, stderr = self._run_command(['git', 'lfs', 'logs', 'last'])
+        code, stdout, stderr = self._run_command([self.git_path, 'lfs', 'logs', 'last'])
         if code != 0:
             self.logger.error(f"Failed to get LFS logs: {stderr}")
             return ""
@@ -302,7 +238,7 @@ class GitLFS:
             True if successful, False otherwise
         """
         code, stdout, stderr = self._run_command([
-            'git', 'lfs', 'migrate', 'import', '--include', file_pattern, '--yes'
+            self.git_path, 'lfs', 'migrate', 'import', '--include', file_pattern, '--yes'
         ])
         if code != 0:
             self.logger.error(f"Failed to migrate {file_pattern}: {stderr}")
@@ -317,7 +253,7 @@ class GitLFS:
         Returns:
             True if successful, False otherwise
         """
-        code, stdout, stderr = self._run_command(['git', 'lfs', 'prune'])
+        code, stdout, stderr = self._run_command([self.git_path, 'lfs', 'prune'])
         if code != 0:
             self.logger.error(f"Failed to clean LFS cache: {stderr}")
             return False
